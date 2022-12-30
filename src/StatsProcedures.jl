@@ -1,7 +1,7 @@
 module StatsProcedures
 
 using Base: sym_in
-using Combinatorics: combinations
+using Graphs: SimpleDiGraph, add_edge!, topological_sort_by_dfs
 using MacroTools: @capture, isexpr, postwalk
 
 import Base: ==, show, eltype, firstindex, lastindex, getindex, iterate, length
@@ -17,16 +17,16 @@ export StatsStep,
 """
     StatsStep{Alias, F<:Function, ById}
 
-Specify the function for moving a step in an [`AbstractStatsProcedure`](@ref).
+Specification for a step in an [`AbstractStatsProcedure`](@ref).
 An instance of `StatsStep` is callable.
 
 # Parameters
 - `Alias::Symbol`: alias of the type for pretty-printing.
-- `F<:Function`: type of the function to be called by `StatsStep`.
+- `F<:Function`: type of the function to be called by `StatsStep` with `F.instance`.
 - `ById::Bool`: whether arguments from multiple [`StatsSpec`](@ref)s should be grouped by `object-id` or `isequal`.
 
 # Methods
-    (step::StatsStep{A,F})(ntargs::NamedTuple; verbose::Bool=false)
+    (step::StatsStep{A,F})(ntargs::NamedTuple; verbose::Union{Bool,IO}=false)
 
 Call an instance of function of type `F` with arguments extracted from `ntargs`
 via [`groupargs`](@ref) and [`combinedargs`](@ref).
@@ -34,6 +34,7 @@ via [`groupargs`](@ref) and [`combinedargs`](@ref).
 A message with the name of the `StatsStep` is printed to `stdout`
 if a keyword `verbose` takes the value `true`
 or `ntargs` contains a key-value pair `verbose=true`.
+Alternative `IO` stream can be specified by setting the value of `verbose`.
 The value from `ntargs` supersedes the keyword argument
 in case both are specified.
 
@@ -112,17 +113,29 @@ See also [`proceed`](@ref).
 """
 combinedargs(::StatsStep, ::Any) = ()
 
+"""
+    copyargs(s::StatsStep)
+
+Return a tuple of indices of arguments that are mutable objects
+that may be modified in-place by `s`.
+This allows making copys of mutable objects that are initially shared
+across multiple specifications.
+"""
 copyargs(::StatsStep) = ()
 
+_parse_verbose(verbose::Bool) = (verbose, stdout)
+_parse_verbose(verbose::IO) = (true, verbose)
+
 function (step::StatsStep{A,F})(@nospecialize(ntargs::NamedTuple);
-        verbose::Bool=false) where {A,F}
+        verbose::Union{Bool,IO}=false) where {A,F}
     haskey(ntargs, :verbose) && (verbose = ntargs.verbose)
-    verbose && printstyled("Running ", step, "\n", color=:green)
+    verbose, io = _parse_verbose(verbose)
+    verbose && printstyled(io, "Running ", step, "\n", color=:green)
     ret = F.instance(groupargs(step, ntargs)..., combinedargs(step, (ntargs,))...)
     return merge(ntargs, ret)
 end
 
-(step::StatsStep)(; verbose::Bool=false) = step(NamedTuple(), verbose=verbose)
+(step::StatsStep)(; kwargs...) = step(NamedTuple(); kwargs...)
 
 show(io::IO, ::StatsStep{A}) where A = print(io, A)
 
@@ -164,6 +177,17 @@ getindex(::AbstractStatsProcedure{A,T}, i::Int) where {A,T} = T.parameters[i].in
 iterate(p::AbstractStatsProcedure, state=1) =
     state > length(p) ? nothing : (p[state], state+1)
 
+"""
+    prerequisites(p::AbstractStatsProcedure, s::StatsStep)
+
+Return a tuple of [`StatsStep`](@ref)s that must be completed
+prior to executing step `s` when conducting procedure `p`.
+If `p` consists of more than one [`StatsStep`](@ref),
+this method must be defined for each step in `p`
+in order to allow [`pool`](@ref) to share a [`StatsStep`](@ref) across multiple procedures.
+"""
+prerequisites(::AbstractStatsProcedure{A,Tuple{T}}, ::T) where {A,T} = ()
+
 show(io::IO, ::AbstractStatsProcedure{A}) where A = print(io, A)
 
 function show(io::IO, ::MIME"text/plain", p::AbstractStatsProcedure{A,T}) where {A,T}
@@ -181,28 +205,26 @@ function show(io::IO, ::MIME"text/plain", p::AbstractStatsProcedure{A,T}) where 
 end
 
 """
-    SharedStatsStep
+    SharedStatsStep{Alias, F<:Function, ById}
 
 A [`StatsStep`](@ref) that is possibly shared by
 multiple instances of procedures that are subtypes of [`AbstractStatsProcedure`](@ref).
-See also [`PooledStatsProcedure`](@ref).
+See also [`PooledStatsProcedure`](@ref) and [`pool`](@ref).
 
 # Fields
-- `step::StatsStep`: the `step` that may be shared.
+- `step::StatsStep{Alias, F, ById}`: the `step` that may be shared.
 - `ids::Vector{Int}`: indices of procedures that share `step`.
 """
-struct SharedStatsStep
-    step::StatsStep
+struct SharedStatsStep{Alias, F<:Function, ById}
+    step::StatsStep{Alias, F, ById}
     ids::Vector{Int}
-    function SharedStatsStep(s::StatsStep, ids)
-        ids = unique!(sort!([ids...]))
-        return new(s, ids)
-    end
 end
 
+SharedStatsStep(step::StatsStep, ids) = SharedStatsStep(step, Int[ids...])
+
 _sharedby(s::SharedStatsStep) = s.ids
-_f(s::SharedStatsStep) = _f(s.step)
-_byid(s::SharedStatsStep) = _byid(s.step)
+_f(::SharedStatsStep{A,F}) where {A,F} = F.instance
+_byid(::SharedStatsStep{A,F,I}) where {A,F,I} = I
 groupargs(s::SharedStatsStep, @nospecialize(ntargs::NamedTuple)) = groupargs(s.step, ntargs)
 combinedargs(s::SharedStatsStep, v::AbstractArray) = combinedargs(s.step, v)
 copyargs(s::SharedStatsStep) = copyargs(s.step)
@@ -236,100 +258,51 @@ struct PooledStatsProcedure
     steps::Vector{SharedStatsStep}
 end
 
-function _sort(psteps::Vector{Vector{SharedStatsStep}})
-    N = length(psteps)
-    sorted = SharedStatsStep[]
-    state = [length(s) for s in psteps]
-    pending = state .> 0
-    while any(pending)
-        pid = (1:N)[pending]
-        firsts = [psteps[i][end-state[i]+1] for i in pid]
-        for (i, fstep) in enumerate(firsts)
-            nshared = length(_sharedby(fstep))
-            if nshared == 1
-                push!(sorted, fstep)
-                state[pid[i]] -= 1
-            else
-                shared = firsts .== Ref(fstep)
-                if sum(shared) == nshared
-                    push!(sorted, fstep)
-                    state[pid[shared]] .-= 1
-                    break
-                end
-            end
-        end
-        pending .= state .> 0
-    end
-    return sorted
-end
-
 """
-    pool(ps::AbstractStatsProcedure...)
+    pool(ps::Vector{AbstractStatsProcedure})
 
-Construct a [`PooledStatsProcedure`](@ref) by determining
-how each [`StatsStep`](@ref) is shared among several procedures in `ps`.
-
-It is unsafe to share the same [`StatsStep`](@ref) in different procedures
-due to the relative position of this step to the other common steps
-among these procedures.
-The fallback method implemented for a collection of [`AbstractStatsProcedure`](@ref)
-avoids sharing steps of which the relative positions
-are not compatible between a pair of procedures.
+Return a [`PooledStatsProcedure`](@ref) with identical [`StatsStep`](@ref)s
+shared among several procedures in `ps` as [`SharedStatsStep`](@ref)s.
+Steps are sorted based on dependencies specified with [`prerequisites`](@ref).
 """
-function pool(ps::AbstractStatsProcedure...)
-    ps = AbstractStatsProcedure[ps...]
+function pool(ps::Vector{AbstractStatsProcedure})
     nps = length(ps)
-    steps = union(ps...)
-    N = sum(length.(ps))
-    if length(steps) < N
-        shared = [Vector{SharedStatsStep}(undef, length(p)) for p in ps]
-        step_pos = Dict{StatsStep,Dict{Int64,Int64}}()
-        for (i, p) in enumerate(ps)
-            for n in 1:length(p)
-                if haskey(step_pos, p[n])
-                    step_pos[p[n]][i] = n
-                else
-                    step_pos[p[n]] = Dict(i=>n)
-                end
-            end
-        end
-        for (step, pos) in step_pos
-            if length(pos) == 1
-                kv = collect(pos)[1]
-                shared[kv[1]][kv[2]] = SharedStatsStep(step, kv[1])
+    nps == 1 && return PooledStatsProcedure(ps, [SharedStatsStep(s, [1]) for s in ps[1]])
+    nv = 0
+    steps = SharedStatsStep[]
+    lookup = Dict{StatsStep, Int}()
+    for i in 1:nps
+        for s in ps[i]
+            iv = get(lookup, s, 0)
+            if iszero(iv)
+                nv += 1
+                push!(steps, SharedStatsStep(s, [i]))
+                lookup[s] = nv
             else
-                shared_pid = collect(keys(pos))
-                for c in combinations(shared_pid, 2)
-                    csteps = intersect(ps[c[1]], ps[c[2]])
-                    pos1 = sort(csteps, by=x->step_pos[x][c[1]])
-                    pos2 = sort(csteps, by=x->step_pos[x][c[2]])
-                    rank1 = findfirst(x->x==step, pos1)
-                    rank2 = findfirst(x->x==step, pos2)
-                    if rank1 != rank2
-                        setdiff!(shared_pid, c)
-                        shared[c[1]][pos[c[1]]] = SharedStatsStep(step, c[1])
-                        shared[c[2]][pos[c[2]]] = SharedStatsStep(step, c[2])
-                        length(shared_pid) <= 1 && break
-                    end
-                end
-                if length(shared_pid) > 0
-                    N = N - length(shared_pid) + 1
-                    for p in shared_pid
-                        shared[p][pos[p]] = SharedStatsStep(step, shared_pid)
-                    end
+                push!(steps[iv].ids, i)
+            end
+        end
+    end
+    N = length(steps)
+    if N < sum(length, ps)
+        dag = SimpleDiGraph(N)
+        for p in ps
+            for s in p
+                for pr in prerequisites(p, s)
+                    add_edge!(dag, lookup[pr], lookup[s])
                 end
             end
         end
-        shared = _sort(shared)
+        try
+            order = topological_sort_by_dfs(dag)
+            return PooledStatsProcedure(ps, steps[order])
+        catch
+            error("procedures cannot be pooled together as dependencies among steps cannot be resolved")
+        end
     else
-        shared = [SharedStatsStep(s, i) for (i,p) in enumerate(ps) for s in p]
+        return PooledStatsProcedure(ps, steps)
     end
-    return PooledStatsProcedure(ps, shared)
 end
-
-# A shortcut for the simple case
-pool(p::AbstractStatsProcedure) =
-    PooledStatsProcedure(AbstractStatsProcedure[p], [SharedStatsStep(s, 1) for s in p])
 
 length(p::PooledStatsProcedure) = length(p.steps)
 eltype(::Type{PooledStatsProcedure}) = SharedStatsStep
@@ -360,7 +333,7 @@ end
 """
     StatsSpec{T<:AbstractStatsProcedure}
 
-Record the specification for a statistical procedure of type `T`.
+Specification for a statistical procedure of type `T`.
 
 An instance of `StatsSpec` is callable and
 its fields provide all information necessary for conducting the procedure.
@@ -371,23 +344,22 @@ An optional name for the specification can be specified.
 - `args::NamedTuple`: arguments for the [`StatsStep`](@ref)s in `T` (default values are merged into `args` if not found in `args`).
 
 # Methods
-    (sp::StatsSpec{T})(; verbose::Bool=false, keep=nothing, keepall::Bool=false)
+    (sp::StatsSpec{T})(; verbose::Union{Bool,IO}=false, keep=nothing, keepall::Bool=false)
 
 Execute the procedure of type `T` with the arguments specified in `args`.
 By default, a dedicated result object for `T` is returned if it is available.
 Otherwise, the last value returned by the last [`StatsStep`](@ref) is returned.
 
 ## Keywords
-- `verbose::Bool=false`: print the name of each step when it is called.
+- `verbose::Union{Bool,IO}=false`: print the name of each step to `stdout` or the specified `IO` stream when it is called.
 - `keep=nothing`: names (of type `Symbol`) of additional objects to be returned.
 - `keepall::Bool=false`: return all objects returned by each step.
 """
-struct StatsSpec{T<:AbstractStatsProcedure}
+struct StatsSpec{T<:AbstractStatsProcedure, A<:NamedTuple}
     name::String
-    args::NamedTuple
-    StatsSpec(name::Union{Symbol,String},
-        T::Type{<:AbstractStatsProcedure}, @nospecialize(args::NamedTuple)) =
-            new{T}(string(name), args)
+    args::A
+    StatsSpec(name, T::Type{<:AbstractStatsProcedure}, args::NamedTuple) =
+            new{T, typeof(args)}(string(name), args)
 end
 
 """
@@ -425,8 +397,8 @@ while ignoring the orders.
 _procedure(::StatsSpec{T}) where T = T
 
 function (sp::StatsSpec{T})(;
-        verbose::Bool=false, keep=nothing, keepall::Bool=false) where T
-    args = verbose ? merge(sp.args, (verbose=true,)) : sp.args
+        verbose::Union{Bool,IO}=false, keep=nothing, keepall::Bool=false) where T
+    args = verbose == false ? sp.args : merge(sp.args, (verbose=verbose,))
     ntall = result(T, foldl(|>, T(), init=args))
     if keepall
         return ntall
@@ -471,12 +443,12 @@ end
 """
     proceed(sps::AbstractVector{<:StatsSpec}; kwargs...)
 
-Carry out the procedures for the [`StatsSpec`](@ref)s in `sps`
+Conduct the procedures for the [`StatsSpec`](@ref)s in `sps`
 while trying to avoid repeating identical steps for the [`StatsSpec`](@ref)s.
 See also [`@specset`](@ref).
 
 # Keywords
-- `verbose::Bool=false`: print the name of each step when it is called.
+- `verbose::Union{Bool,IO}=false`: print the name of each step to `stdout` or the specified `IO` stream when it is called.
 - `keep=nothing`: names (of type `Symbol`) of additional objects to be returned.
 - `keepall::Bool=false`: return all objects generated by procedures along with arguments from the [`StatsSpec`](@ref)s.
 - `pause::Int=0`: break the iteration over [`StatsStep`](@ref)s after finishing the specified number of steps (for debugging).
@@ -491,9 +463,10 @@ When either `keep` or `keepall` is specified,
 a `NamedTuple` with additional objects is formed for each [`StatsSpec`](@ref).
 """
 function proceed(sps::Vector{<:StatsSpec};
-        verbose::Bool=false, keep=nothing, keepall::Bool=false, pause::Int=0)
+        verbose::Union{Bool,IO}=false, keep=nothing, keepall::Bool=false, pause::Int=0)
     nsps = length(sps)
     nsps == 0 && throw(ArgumentError("expect a nonempty vector"))
+    verbose, io = _parse_verbose(verbose)
 
     gids = IdDict{AbstractStatsProcedure, Vector{Int}}()
     objcount = IdDict{Any, Int}()
@@ -504,8 +477,8 @@ function proceed(sps::Vector{<:StatsSpec};
         foreach(x->_count!(objcount, x), args)
         traces[i] = args
     end
-    
-    steps = pool((p for p in keys(gids))...)
+
+    steps = pool(collect(AbstractStatsProcedure, keys(gids)))
     tasks_byid = IdDict{Tuple, Vector{Int}}()
     tasks_byeq = Dict{Tuple, Vector{Int}}()
     ntask_total = 0
@@ -513,7 +486,7 @@ function proceed(sps::Vector{<:StatsSpec};
     paused = false
     @inbounds for step in steps
         tasks = _byid(step) ? tasks_byid : tasks_byeq
-        verbose && print("Running ", step, "...")
+        verbose && print(io, "Running ", step, "...")
         # Group arguments by objectid or isequal
         for i in _sharedby(step)
             traceids = gids[steps.procs[i]]
@@ -523,7 +496,7 @@ function proceed(sps::Vector{<:StatsSpec};
         end
         ntask = length(tasks)
         nprocs = length(_sharedby(step))
-        verbose && print("Scheduled ", ntask, ntask > 1 ? " tasks" : " task", " for ",
+        verbose && print(io, "Scheduled ", ntask, ntask > 1 ? " tasks" : " task", " for ",
             nprocs, nprocs > 1 ? " procedures" : " procedure", "...\n")
 
         for (gargs, ids) in tasks
@@ -546,14 +519,14 @@ function proceed(sps::Vector{<:StatsSpec};
         end
         ntask_total += ntask
         empty!(tasks)
-        verbose && print("  Finished ", ntask, ntask > 1 ? " tasks" : " task", " for ",
+        verbose && print(io, "  Finished ", ntask, ntask > 1 ? " tasks" : " task", " for ",
             nprocs, nprocs > 1 ? " procedures\n" : " procedure\n")
         step_count += 1
         step_count === pause && (paused = true) && break
     end
 
     nprocs = length(steps.procs)
-    verbose && printstyled("All steps finished (", ntask_total,
+    verbose && printstyled(io, "All steps finished (", ntask_total,
         ntask_total > 1 ? " tasks" : " task", " for ", nprocs,
         nprocs > 1 ? " procedures)\n" : " procedure)\n", bold=true, color=:green)
     if !paused
@@ -686,7 +659,7 @@ specifying the name of the option is enough for setting the value to be true.
     
 The following options are available for altering the behavior of `@specset`:
 - `noproceed::Bool=false`: do not call [`proceed`](@ref) and only return the vector of [`StatsSpec`](@ref)s.
-- `verbose::Bool=false`: print the name of each step when it is called.
+- `verbose::Union{Bool,IO}=false`: print the name of each step to `stdout` or the specified `IO` stream when it is called.
 - `keep=nothing`: names (of type `Symbol`) of additional objects to be returned.
 - `keepall::Bool=false`: return all objects generated by procedures along with arguments from the [`StatsSpec`](@ref)s.
 - `pause::Int=0`: break the iteration over [`StatsStep`](@ref)s after finishing the specified number of steps (for debugging).
@@ -719,7 +692,7 @@ macro specset(args...)
     nformatter = length(unique!(formatters))
     nformatter == 1 ||
         throw(ArgumentError("found $nformatter formatters from arguments while expecting one"))
-    
+
     parser, formatter = parsers[1], formatters[1]
     if default_args === nothing
         defaults = :(Dict{Symbol,Any}())

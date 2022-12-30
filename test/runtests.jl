@@ -2,7 +2,7 @@ using Test
 using StatsProcedures
 
 using StatsProcedures: _f, _get, groupargs, _sharedby, ≊, _show_args, _parse!, pool, proceed
-import StatsProcedures: required, default, transformed, combinedargs, copyargs
+import StatsProcedures: required, default, transformed, combinedargs, copyargs, prerequisites
 
 testvoidstep(a::String) = NamedTuple()
 const TestVoidStep = StatsStep{:TestVoidStep, typeof(testvoidstep), true}
@@ -68,6 +68,10 @@ const TestUnnamedStep = StatsStep{:TestUnnamedStep, typeof(testregstep), true}
         ret = TestArrayStep()((a="a", c=c,))
         @test ret.result === c
 
+        io = IOBuffer()
+        TestRegStep()(verbose=io)
+        @test String(take!(io)) == "Running TestRegStep\n"
+
         @test sprint(show, TestVoidStep()) == "TestVoidStep"
         @test sprint(show, MIME("text/plain"), TestVoidStep()) ==
             "TestVoidStep (StatsStep that calls testvoidstep)"
@@ -76,14 +80,27 @@ end
 
 struct TestProcedure{A,T} <: AbstractStatsProcedure{A,T} end
 const RP = TestProcedure{:RegProcedure,Tuple{TestVoidStep,TestRegStep,TestLastStep}}
+prerequisites(::RP, ::TestVoidStep) = ()
+prerequisites(::RP, ::TestRegStep) = ()
+prerequisites(::RP, ::TestLastStep) = (TestRegStep(),)
 const rp = RP()
 const IP = TestProcedure{:InverseProcedure,Tuple{TestRegStep,TestVoidStep,TestLastStep}}
+prerequisites(::IP, ::TestVoidStep) = ()
+prerequisites(::IP, ::TestRegStep) = ()
+prerequisites(::IP, ::TestLastStep) = (TestRegStep(),)
 const ip = IP()
+const EP = TestProcedure{:ErrorProcedure,Tuple{TestLastStep,TestRegStep,TestVoidStep}}
+prerequisites(::EP, ::TestLastStep) = ()
+prerequisites(::EP, ::TestRegStep) = (TestLastStep(),)
+prerequisites(::EP, ::TestVoidStep) = ()
+const ep = EP()
 const UP = TestProcedure{:UnitProcedure,Tuple{TestRegStep}}
 const up = UP()
 const NP = TestProcedure{:NullProcedure,Tuple{}}
 const np = NP()
 const CP = TestProcedure{:CombineProcedure,Tuple{TestCombineStep,TestArrayStep}}
+prerequisites(::CP, ::TestCombineStep) = ()
+prerequisites(::CP, ::TestArrayStep) = (TestCombineStep(),)
 const cp = CP()
 const AP = TestProcedure{:ArrayProcedure,Tuple{TestArrayStep}}
 const ap = AP()
@@ -110,6 +127,9 @@ const ap = AP()
     @test_throws BoundsError np[1]
     @test iterate(np) === nothing
 
+    @test prerequisites(up, TestRegStep()) == ()
+    @test_throws MethodError prerequisites(up, TestVoidStep())
+
     @test sprint(show, rp) == "RegProcedure"
     @test sprint(show, MIME("text/plain"), rp) == """
         RegProcedure (TestProcedure with 3 steps):
@@ -127,7 +147,7 @@ end
 
 @testset "SharedStatsStep" begin
     s1 = SharedStatsStep(TestRegStep(), 1)
-    s2 = SharedStatsStep(TestRegStep(), [3,2])
+    s2 = SharedStatsStep(TestRegStep(), [2,3])
     @test _sharedby(s1) == [1]
     @test _sharedby(s2) == [2,3]
     @test _f(s1) == testregstep
@@ -144,7 +164,7 @@ end
 @testset "PooledStatsProcedure" begin
     ps = AbstractStatsProcedure[rp]
     shared = [SharedStatsStep(s, 1) for s in rp]
-    p1 = pool(rp)
+    p1 = pool(ps)
     @test p1 == PooledStatsProcedure(ps, shared)
     @test length(p1) == 3
     @test eltype(PooledStatsProcedure) == SharedStatsStep
@@ -156,40 +176,41 @@ end
     @test iterate(p1, 2) == (shared[2], 3)
 
     ps = AbstractStatsProcedure[rp, rp]
-    shared = [SharedStatsStep(s, (1,2)) for s in rp]
-    p2 = pool(rp, rp)
-    @test p2 == PooledStatsProcedure(ps, shared)
+    shared1 = [SharedStatsStep(s, (1,2)) for s in rp]
+    shared2 = [SharedStatsStep(s, (1,2)) for s in rp[[2,3,1]]]
+    p2 = pool(ps)
+    @test p2 ∈ (PooledStatsProcedure(ps, shared1), PooledStatsProcedure(ps, shared2))
     @test length(p2) == 3
 
     ps = AbstractStatsProcedure[up, up]
     shared = [SharedStatsStep(s, (1,2)) for s in up]
-    p3 = pool(up, up)
+    p3 = pool(ps)
     @test p3 == PooledStatsProcedure(ps, shared)
     @test length(p3) == 1
 
     ps = AbstractStatsProcedure[np]
     shared = []
-    p4 = pool(np)
+    p4 = pool(ps)
     @test p4 == PooledStatsProcedure(ps, shared)
     @test length(p4) == 0
 
     ps = AbstractStatsProcedure[up, rp]
     shared = [SharedStatsStep(rp[1], 2), SharedStatsStep(rp[2], (1,2)), SharedStatsStep(rp[3], 2)]
-    p5 = pool(up, rp)
+    p5 = pool(ps)
     @test p5 == PooledStatsProcedure(ps, shared)
     @test length(p5) == 3
 
     ps = AbstractStatsProcedure[rp, ip]
-    shared = [SharedStatsStep(rp[1], 1), SharedStatsStep(ip[1], 2), SharedStatsStep(rp[2], 1),
-        SharedStatsStep(ip[2], 2), SharedStatsStep(rp[3], (1,2))]
-    p6 = pool(rp, ip)
-    @test p6 == PooledStatsProcedure(ps, shared)
-    @test length(p6) == 5
+    shared1 = [SharedStatsStep(s, (1,2)) for s in rp]
+    shared2 = [SharedStatsStep(s, (1,2)) for s in rp[[2,3,1]]]
+    p6 = pool(ps)
+    @test p6 ∈ (PooledStatsProcedure(ps, shared1), PooledStatsProcedure(ps, shared2))
+    @test length(p6) == 3
 
     ps = AbstractStatsProcedure[rp, cp]
     shared = [SharedStatsStep(rp[1], 1), SharedStatsStep(rp[2], 1),
         SharedStatsStep(rp[3], 1), SharedStatsStep(cp[1], 2), SharedStatsStep(cp[2], 2)]
-    p7 = pool(rp, cp)
+    p7 = pool(ps)
     @test p7 == PooledStatsProcedure(ps, shared)
     @test length(p7) == 5
 
@@ -212,6 +233,9 @@ end
     @test sprint(show, MIME("text/plain"), p4) == """
         PooledStatsProcedure with 0 step from 1 procedure:
           NullProcedure"""
+
+    ps = AbstractStatsProcedure[rp, ep]
+    @test_throws ErrorException pool(ps)
 end
 
 @testset "StatsSpec" begin
@@ -276,7 +300,27 @@ testformatter(arg::Dict{Symbol,Any}) = (get(arg, :name, ""), arg[:p], (a=arg[:a]
     @test proceed([s1,s3], verbose=true) == ["aab", "aab1"]
     @test proceed([s1,s4], verbose=true) == ["aab", "ab"]
     @test proceed([s1,s5], verbose=true) == ["aab", "aab"]
-    @test proceed([s1,s4,s5], verbose=true) == ["aab", "ab", "aab"]
+    io = IOBuffer()
+    @test proceed([s1,s4,s5], verbose=io) == ["aab", "ab", "aab"]
+    str1 = """
+        Running TestRegStep...Scheduled 1 task for 3 procedures...
+          Finished 1 task for 3 procedures
+        Running TestLastStep...Scheduled 1 task for 2 procedures...
+          Finished 1 task for 2 procedures
+        Running TestVoidStep...Scheduled 1 task for 2 procedures...
+          Finished 1 task for 2 procedures
+        All steps finished (3 tasks for 3 procedures)
+        """
+    str2 = """
+        Running TestVoidStep...Scheduled 1 task for 2 procedures...
+          Finished 1 task for 2 procedures
+        Running TestRegStep...Scheduled 1 task for 3 procedures...
+          Finished 1 task for 3 procedures
+        Running TestLastStep...Scheduled 1 task for 2 procedures...
+          Finished 1 task for 2 procedures
+        All steps finished (3 tasks for 3 procedures)
+        """
+    @test String(take!(io)) ∈ (str1, str2)
 
     @test proceed([s1], keep=:a) == [(a="a",result="aab")]
     @test proceed([s1], keep=[:a,:b]) == [(a="a", b="b", result="aab")]

@@ -44,7 +44,6 @@ in case both are specified.
 struct StatsStep{Alias, F<:Function, ById} end
 
 _f(::StatsStep{A,F}) where {A,F} = F.instance
-_byid(::StatsStep{A,F,I}) where {A,F,I} = I
 
 """
     required(s::StatsStep)
@@ -438,6 +437,13 @@ end
 function _count!(objcount::AbstractDict, obj)
     count = get(objcount, obj, 0)
     objcount[obj] = count + 1
+end
+
+if VERSION == v"1.0"
+    function Base.get!(f::Function, dict::IdDict, key)
+        out = get(dict, key, nothing)
+        return out === nothing ? f() : out
+    end
 end
 
 """

@@ -1,7 +1,7 @@
 name = "StatsProcedures"
 uuid = "d2f4e7c0-4966-47f3-9552-d63f8a71a436"
 authors = ["Junyuan Chen <norman.chen.git@gmail.com>"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"

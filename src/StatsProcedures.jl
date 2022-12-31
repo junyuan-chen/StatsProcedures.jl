@@ -17,7 +17,7 @@ export StatsStep,
 if VERSION < v"1.1-DEV"
     function Base.get!(default::Base.Callable, d::IdDict{K,V}, @nospecialize(key)) where {K, V}
         val = get(d, key, Base.secret_table_token)
-        return val === Base.secret_table_token ? setindex!(d, default(), key) : val
+        return val === Base.secret_table_token ? (d[key] = default()) : val
     end
 end
 

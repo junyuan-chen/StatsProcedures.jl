@@ -445,7 +445,7 @@ end
 if VERSION < v"1.1-DEV"
     function Base.get!(f::Type, dict::IdDict, key)
         val = get(dict, key, nothing)
-        return out === nothing ? (dict[key] = f()) : val
+        return val === nothing ? (dict[key] = f()) : val
     end
 end
 

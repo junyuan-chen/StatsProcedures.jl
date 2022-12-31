@@ -275,9 +275,9 @@ Steps are sorted based on dependencies specified with [`prerequisites`](@ref).
 function pool(ps::Vector{AbstractStatsProcedure})
     nps = length(ps)
     nps == 0 && return PooledStatsProcedure(ps, SharedStatsStep[])
-    nps == 1 && return PooledStatsProcedure(ps, [SharedStatsStep(s, [1]) for s in ps[1]])
     Nall = sum(length, ps)
     Nall == 0 && return PooledStatsProcedure(ps, SharedStatsStep[])
+    nps == 1 && return PooledStatsProcedure(ps, [SharedStatsStep(s, [1]) for s in ps[1]])
     nv = 0
     steps = SharedStatsStep[]
     lookup = Dict{StatsStep, Int}()

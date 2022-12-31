@@ -14,6 +14,13 @@ export StatsStep,
        proceed,
        @specset
 
+if VERSION < v"1.1-DEV"
+    function Base.get!(default::Base.Callable, d::IdDict{K,V}, @nospecialize(key)) where {K, V}
+        val = get(d, key, Base.secret_table_token)
+        return val === Base.secret_table_token ? setindex!(d, default(), key) : val
+    end
+end
+
 """
     StatsStep{Alias, F<:Function, ById}
 
@@ -92,7 +99,7 @@ However, in most cases, there is no need to define new methods
 for concrete [`StatsStep`](@ref)s.
 Instead, one should define methods for
 [`required`](@ref), [`default`](@ref) or [`transformed`](@ref).
-See also [`combinedargs`](@ref).
+See also [`combinedargs`](@ref) and [`copyargs`](@ref).
 """
 groupargs(s::StatsStep, @nospecialize(ntargs::NamedTuple)) =
     (_get(ntargs, required(s))..., _get(ntargs, default(s))...,
@@ -108,7 +115,7 @@ The element type of `allntargs` can be assumed to be `NamedTuple`.
 This function allows combining arguments that differ
 across specifications in the same group classified based on [`groupargs`](@ref)
 into objects that are accepted by the call of `s`.
-See also [`proceed`](@ref).
+See also [`copyargs`](@ref) and [`proceed`](@ref).
 """
 combinedargs(::StatsStep, ::Any) = ()
 
@@ -119,6 +126,7 @@ Return a tuple of indices of arguments that are mutable objects
 that may be modified in-place by `s`.
 This allows making copys of mutable objects that are initially shared
 across multiple specifications.
+See also [`groupargs`](@ref), [`combinedargs`](@ref) and [`proceed`](@ref).
 """
 copyargs(::StatsStep) = ()
 
@@ -361,7 +369,7 @@ struct StatsSpec{T<:AbstractStatsProcedure, A<:NamedTuple}
     name::String
     args::A
     StatsSpec(name, T::Type{<:AbstractStatsProcedure}, args::NamedTuple) =
-            new{T, typeof(args)}(string(name), args)
+        new{T, typeof(args)}(string(name), args)
 end
 
 """
@@ -440,17 +448,6 @@ end
 function _count!(objcount::AbstractDict, obj)
     count = get(objcount, obj, 0)
     objcount[obj] = count + 1
-end
-
-if VERSION < v"1.1-DEV"
-    function Base.get!(default::Base.Callable, d::IdDict{K,V}, @nospecialize(key)) where {K, V}
-        val = get(d, key, Base.secret_table_token)
-        if val === Base.secret_table_token
-            val = default()
-            setindex!(d, val, key)
-        end
-        return val
-    end
 end
 
 """

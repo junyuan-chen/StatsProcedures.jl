@@ -266,7 +266,10 @@ Steps are sorted based on dependencies specified with [`prerequisites`](@ref).
 """
 function pool(ps::Vector{AbstractStatsProcedure})
     nps = length(ps)
+    nps == 0 && return PooledStatsProcedure(ps, SharedStatsStep[])
     nps == 1 && return PooledStatsProcedure(ps, [SharedStatsStep(s, [1]) for s in ps[1]])
+    Nall = sum(length, ps)
+    Nall == 0 && return PooledStatsProcedure(ps, SharedStatsStep[])
     nv = 0
     steps = SharedStatsStep[]
     lookup = Dict{StatsStep, Int}()
@@ -283,7 +286,7 @@ function pool(ps::Vector{AbstractStatsProcedure})
         end
     end
     N = length(steps)
-    if N < sum(length, ps)
+    if N < Nall
         dag = SimpleDiGraph(N)
         for p in ps
             for s in p
@@ -439,10 +442,10 @@ function _count!(objcount::AbstractDict, obj)
     objcount[obj] = count + 1
 end
 
-if VERSION == v"1.0"
-    function Base.get!(f::Function, dict::IdDict, key)
-        out = get(dict, key, nothing)
-        return out === nothing ? f() : out
+if VERSION < v"1.1-DEV"
+    function Base.get!(f::Type, dict::IdDict, key)
+        val = get(dict, key, nothing)
+        return out === nothing ? (dict[key] = f()) : val
     end
 end
 
@@ -471,7 +474,7 @@ a `NamedTuple` with additional objects is formed for each [`StatsSpec`](@ref).
 function proceed(sps::Vector{<:StatsSpec};
         verbose::Union{Bool,IO}=false, keep=nothing, keepall::Bool=false, pause::Int=0)
     nsps = length(sps)
-    nsps == 0 && throw(ArgumentError("expect a nonempty vector"))
+    nsps == 0 && throw(ArgumentError("empty sps is not accepted"))
     verbose, io = _parse_verbose(verbose)
 
     gids = IdDict{AbstractStatsProcedure, Vector{Int}}()

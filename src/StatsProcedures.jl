@@ -443,9 +443,13 @@ function _count!(objcount::AbstractDict, obj)
 end
 
 if VERSION < v"1.1-DEV"
-    function Base.get!(f::Type, dict::IdDict, key)
-        val = get(dict, key, nothing)
-        return val === nothing ? (dict[key] = f()) : val
+    function Base.get!(default::Base.Callable, d::IdDict{K,V}, @nospecialize(key)) where {K, V}
+        val = get(d, key, Base.secret_table_token)
+        if val === Base.secret_table_token
+            val = default()
+            setindex!(d, val, key)
+        end
+        return val
     end
 end
 
